@@ -1,0 +1,13 @@
+# Ignore build artifacts and binaries
+build/
+*.o
+*.so
+mbuffer
+tapetest
+have-af
+idev
+config.h
+config.log
+config.status
+version.h
+mbuffer.1
