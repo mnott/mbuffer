@@ -670,6 +670,7 @@ static void *outputThread(void *arg)
 	unsigned long long blocksize = Blocksize;
 	long long xfer = 0;
 	struct timespec last;
+	int watermark_paused = 0; /* track if we're paused due to low watermark */
 
 	assert(NumSenders >= 0);
 	if (dest->next) {
@@ -719,8 +720,41 @@ static void *outputThread(void *arg)
 	for (;;) {
 		unsigned long long rest = blocksize;
 		int err;
+		double fill_percent;
 
-		if ((StartWrite > 0) && (fill <= 0)) {
+		/* Check if we need to pause for water mark control */
+		err = sem_getvalue(&Buf2Dev,&fill);
+		assert(err == 0);
+		fill_percent = (double)fill / (double)Numblocks;
+
+		/* High/Low water mark logic for true flow control */
+		if ((StartWrite > 0) && (StartRead < 1)) {
+			if (!watermark_paused && (fill_percent >= StartWrite)) {
+				/* Buffer full enough - can start/continue writing */
+				watermark_paused = 0;
+			} else if (watermark_paused || (fill_percent <= StartRead)) {
+				/* Buffer too low - pause and wait for high watermark */
+				if (!watermark_paused) {
+					debugmsg("outputThread: buffer at %.1f%%, pausing for refill to %.1f%%\n", 
+						fill_percent * 100, StartWrite * 100);
+					watermark_paused = 1;
+				}
+				err = pthread_mutex_lock(&HighMut);
+				assert(err == 0);
+				pthread_cleanup_push(releaseLock,&HighMut);
+				err = pthread_cond_wait(&PercHigh,&HighMut);
+				assert(err == 0);
+				pthread_cleanup_pop(0);
+				err = pthread_mutex_unlock(&HighMut);
+				assert(err == 0);
+				debugmsg("outputThread: high watermark reached, resuming...\n");
+				watermark_paused = 0;
+				++EmptyCount;
+				(void) clock_gettime(ClockSrc,&last);
+				continue; /* Re-check buffer level */
+			}
+		} else if ((StartWrite > 0) && (fill <= 0)) {
+			/* Original logic for initial fill only */
 			assert(fill == 0);
 			err = pthread_mutex_lock(&HighMut);
 			assert(err == 0);
@@ -1200,8 +1234,8 @@ void checkConsistency(void)
 	}
 	if (Numblocks < 5)
 		fatal("Number of blocks must be at least 5.\n");
-	if ((StartRead < 1) && (StartWrite > 0))
-		fatal("setting both low watermark and high watermark doesn't make any sense...\n");
+	if ((StartRead < 1) && (StartWrite > 0) && (StartRead >= StartWrite))
+		fatal("low watermark must be less than high watermark for flow control!\n");
 	if ((NumSenders-Hashers > 0) && (Autoloader || OutVolsize))
 		fatal("multi-volume support is unsupported with multiple outputs\n");
 	if (Autoloader) {
