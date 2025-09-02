@@ -365,18 +365,50 @@ void *inputThread(void *ignored)
 		int err;
 
 		if (startread < 1) {
+			/* With watermark flow control, pause input at reasonable threshold.
+			 * Use a higher threshold than the original 99% to allow better buffer utilization
+			 * while still coordinating with output thread's pause/resume cycle.
+			 */
 			err = pthread_mutex_lock(&LowMut);
 			assert(err == 0);
 			err = sem_getvalue(&Buf2Dev,&fill);
 			assert(err == 0);
-			if (fill == Numblocks - 1) {
-				debugmsg("inputThread: buffer full, waiting for it to drain.\n");
-				pthread_cleanup_push(releaseLock,&LowMut);
-				err = pthread_cond_wait(&PercLow,&LowMut);
-				assert(err == 0);
-				pthread_cleanup_pop(0);
+			double fill_percent = (double)fill / (double)Numblocks;
+			
+			/* Calculate input watermarks based on CLI settings to coordinate with output thread.
+			 * Input high threshold: 80% of buffer (reasonable upper limit)  
+			 * Input resume threshold: slightly above output high watermark to minimize output pauses
+			 * This keeps buffer above output's pause point whenever possible.
+			 */
+			const double input_pause_threshold = 0.8;  // Input pauses at 80%
+			const double input_resume_threshold = startwrite + 0.05;  // Resume 5% above output high watermark
+			
+			if (fill_percent >= input_pause_threshold) {
+				debugmsg("inputThread: buffer at %.1f%%, waiting for drain below %.1f%%\n", 
+					fill_percent * 100, input_resume_threshold * 100);
+				do {
+					pthread_cleanup_push(releaseLock,&LowMut);
+					/* Use a timeout instead of blocking indefinitely on PercLow
+					 * This allows input to check its own threshold instead of 
+					 * being controlled by output thread's low watermark signal */
+					struct timespec timeout;
+					clock_gettime(CLOCK_REALTIME, &timeout);
+					timeout.tv_nsec += 100000000;  // 100ms timeout
+					if (timeout.tv_nsec >= 1000000000) {
+						timeout.tv_sec += 1;
+						timeout.tv_nsec -= 1000000000;
+					}
+					err = pthread_cond_timedwait(&PercLow,&LowMut,&timeout);
+					/* Ignore timeout errors - we want to check threshold anyway */
+					pthread_cleanup_pop(0);
+					
+					/* Check current fill level */
+					err = sem_getvalue(&Buf2Dev,&fill);
+					assert(err == 0);
+					fill_percent = (double)fill / (double)Numblocks;
+				} while (fill_percent >= input_resume_threshold);
 				++FullCount;
-				debugmsg("inputThread: low watermark reached, continuing...\n");
+				debugmsg("inputThread: buffer at %.1f%%, resuming input\n", fill_percent * 100);
 			}
 			err = pthread_mutex_unlock(&LowMut);
 			assert(err == 0);
