@@ -741,31 +741,48 @@ static void *outputThread(void *arg)
 				++EmptyCount;
 			}
 			
-			/* If we're paused, wait for high watermark */
+			/* If we're paused, wait for high watermark OR end of input */
 			if (watermark_paused) {
-				/* Let input thread know there's space */
-				if (StartRead < 1) {
-					int err_low = pthread_mutex_lock(&LowMut);
-					assert(err_low == 0);
-					err_low = pthread_cond_signal(&PercLow);
-					assert(err_low == 0);
-					err_low = pthread_mutex_unlock(&LowMut);
-					assert(err_low == 0);
-				}
-				
-				/* Small delay instead of waiting for condition - less blocking */
-				usleep(10000); /* 10ms delay */
-				
-				/* Re-check if we've reached high watermark */
-				err = sem_getvalue(&Buf2Dev,&fill);
-				assert(err == 0);
-				fill_percent = (double)fill / (double)Numblocks;
-				if (fill_percent >= StartWrite) {
+				/* Check if input has finished - if so, resume to flush remaining data */
+				if (Finish != -1) {
 					watermark_paused = 0;
-					debugmsg("outputThread: buffer refilled to %.1f%%, resuming...\n", fill_percent * 100);
+					debugmsg("outputThread: input finished, resuming to flush remaining %.1f%% buffer\n", fill_percent * 100);
+				} else {
+					static int pause_cycles = 0;
+					pause_cycles++;
+					
+					/* Safety check: if we've been paused for too long with no progress, resume anyway */
+					if (pause_cycles > 6000) { /* 60 seconds at 10ms intervals */
+						watermark_paused = 0;
+						debugmsg("outputThread: pause timeout after 60s, resuming at %.1f%%\n", fill_percent * 100);
+						pause_cycles = 0;
+					} else {
+						/* Let input thread know there's space */
+						if (StartRead < 1) {
+							int err_low = pthread_mutex_lock(&LowMut);
+							assert(err_low == 0);
+							err_low = pthread_cond_signal(&PercLow);
+							assert(err_low == 0);
+							err_low = pthread_mutex_unlock(&LowMut);
+							assert(err_low == 0);
+						}
+						
+						/* Small delay instead of waiting for condition - less blocking */
+						usleep(10000); /* 10ms delay */
+						
+						/* Re-check if we've reached high watermark */
+						err = sem_getvalue(&Buf2Dev,&fill);
+						assert(err == 0);
+						fill_percent = (double)fill / (double)Numblocks;
+						if (fill_percent >= StartWrite) {
+							watermark_paused = 0;
+							pause_cycles = 0;
+							debugmsg("outputThread: buffer refilled to %.1f%%, resuming...\n", fill_percent * 100);
+						}
+						(void) clock_gettime(ClockSrc,&last);
+						continue; /* Re-check buffer level */
+					}
 				}
-				(void) clock_gettime(ClockSrc,&last);
-				continue; /* Re-check buffer level */
 			}
 		} else if ((StartWrite > 0) && (fill <= 0)) {
 			/* Original logic for initial fill only */
